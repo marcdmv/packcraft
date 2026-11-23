@@ -1,0 +1,104 @@
+name: release
+
+# Builds the CLI and the desktop app for every shipped target and attaches
+# them to a GitHub release. Runs on a pushed tag v*; a tag with a hyphen
+# (v0.1.0-alpha.1) becomes a pre-release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     name: linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, name: linux-arm64 }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest,   name: windows-x64 }
+          - { target: aarch64-pc-windows-msvc,   os: windows-11-arm,   name: windows-arm64 }
+          - { target: aarch64-apple-darwin,      os: macos-latest,     name: macos-arm64 }
+          - { target: x86_64-apple-darwin,       os: macos-latest,     name: macos-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --features gui --target ${{ matrix.target }}
+      - name: No C compiled into the binaries
+        shell: bash
+        run: python3 -I scripts/check-no-c.py target
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || ver="dev-${GITHUB_SHA::7}"
+          dir="packcraft-${ver}-${{ matrix.name }}"
+          bin="target/${{ matrix.target }}/release"
+          mkdir -p "dist/$dir"
+          cp README.md NOTICE LICENSE-MIT LICENSE-APACHE "dist/$dir/"
+          cp assets/fonts/Inter-OFL.txt "dist/$dir/Inter-OFL.txt"
+          case "${{ matrix.target }}" in
+            *windows*)
+              cp "$bin/packcraft.exe" "$bin/packcraft-gui.exe" "dist/$dir/"
+              (cd dist && pwsh -NoProfile -Command "Compress-Archive -Path '$dir' -DestinationPath '$dir.zip'")
+              art="$dir.zip" ;;
+            *apple*)
+              cp "$bin/packcraft" "dist/$dir/"
+              app="dist/$dir/PackCraft.app/Contents"
+              mkdir -p "$app/MacOS"
+              cp "$bin/packcraft-gui" "$app/MacOS/packcraft-gui"
+              sed "s/@VERSION@/$ver/" packaging/macos/Info.plist > "$app/Info.plist"
+              tar -C dist -czf "dist/$dir.tar.gz" "$dir"
+              art="$dir.tar.gz" ;;
+            *)
+              cp "$bin/packcraft" "$bin/packcraft-gui" "dist/$dir/"
+              tar -C dist -czf "dist/$dir.tar.gz" "$dir"
+              art="$dir.tar.gz" ;;
+          esac
+          (cd dist && python3 -I -c "import hashlib,sys; p=sys.argv[1]; print(hashlib.sha256(open(p,'rb').read()).hexdigest()+'  '+p)" "$art" > "$art.sha256")
+          echo "ART=$art" >> "$GITHUB_ENV"
+      - name: Smoke test (native targets only)
+        if: matrix.name != 'macos-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/packcraft"
+          mkdir -p smoke/in && cp README.md NOTICE smoke/in/
+          "$bin" c smoke/t.pcraft smoke/in
+          "$bin" t smoke/t.pcraft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ env.ART }}
+            dist/${{ env.ART }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "PackCraft $GITHUB_REF_NAME" --generate-notes $pre

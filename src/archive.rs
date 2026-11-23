@@ -61,6 +61,14 @@ pub struct Options {
     pub verify: bool,
 }
 
+impl Default for Options {
+    /// The CLI defaults: up to 8 threads, 2^22 hash slots, 16 MB chunks, best mode.
+    fn default() -> Self {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+        Options { threads, table_bits: 22, chunk_bytes: 16 << 20, fast: false, verify: false }
+    }
+}
+
 struct Entry {
     path: String,
     /// 0 = regular file, 1 = symbolic link (its bytes are the link target).
@@ -469,6 +477,13 @@ pub fn list(archive: &Path) -> Result<Vec<ListItem>, String> {
 
 /// Decodes everything and checks every CRC. With `dest`, also writes the files.
 pub fn extract(archive: &Path, dest: Option<&Path>, threads: usize) -> Result<(usize, u64), String> {
+    extract_filtered(archive, dest, threads, &|_| true)
+}
+
+/// Like `extract`, but writes only the entries whose archive path `keep`
+/// accepts. Every entry is still decoded and CRC-checked (solid groups have
+/// to be decoded whole anyway). Returns the count and bytes written.
+pub fn extract_filtered(archive: &Path, dest: Option<&Path>, threads: usize, keep: &dyn Fn(&str) -> bool) -> Result<(usize, u64), String> {
     let data = std::fs::read(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
     let p = parse(&data)?;
     if let Some(d) = dest {
@@ -486,6 +501,7 @@ pub fn extract(archive: &Path, dest: Option<&Path>, threads: usize) -> Result<(u
         solid.append(g);
     }
     let mut total = 0u64;
+    let mut written = 0usize;
     let mut links: Vec<(PathBuf, String)> = Vec::new();
     for e in &p.entries {
         let bytes: &[u8] = if e.group == SOLID {
@@ -501,6 +517,10 @@ pub fn extract(archive: &Path, dest: Option<&Path>, threads: usize) -> Result<(u
         if crc32fast::hash(bytes) != e.crc {
             return Err(format!("{}: CRC mismatch, archive is damaged", e.path));
         }
+        if !keep(&e.path) {
+            continue;
+        }
+        written += 1;
         if let (Some(d), 1) = (dest, e.kind) {
             let target = String::from_utf8(bytes.to_vec()).map_err(|_| format!("{}: link target is not UTF-8", e.path))?;
             check_link_target(&e.path, &target)?;
@@ -521,7 +541,7 @@ pub fn extract(archive: &Path, dest: Option<&Path>, threads: usize) -> Result<(u
         }
         make_symlink(&target, &at)?;
     }
-    Ok((p.entries.len(), total))
+    Ok((written, total))
 }
 
 /// A link target must be relative and must stay inside the extracted tree.

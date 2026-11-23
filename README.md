@@ -45,10 +45,45 @@ Known gaps, in priority order:
   `--fast` when extraction speed matters.
 - **The 7-Zip baseline is 17.05.** Current 7-Zip releases should be measured too.
 
+## Download
+
+Prebuilt binaries for every release are on the
+[Releases page](https://github.com/marcdmv/packcraft/releases):
+
+| System | Archive |
+|---|---|
+| Windows x64 / ARM64 | `packcraft-<ver>-windows-x64.zip`, `-windows-arm64.zip` |
+| macOS Apple Silicon / Intel | `packcraft-<ver>-macos-arm64.tar.gz`, `-macos-x64.tar.gz` (includes `PackCraft.app`) |
+| Linux x64 / ARM64 (glibc 2.35+) | `packcraft-<ver>-linux-x64.tar.gz`, `-linux-arm64.tar.gz` |
+
+Each archive holds the command-line tool `packcraft` and the desktop app
+`packcraft-gui`, with a `.sha256` file next to it. The builds are not code
+signed yet: on macOS run `xattr -dr com.apple.quarantine PackCraft.app` once,
+and on Windows choose "More info, Run anyway" in SmartScreen.
+
+## Desktop app
+
+`packcraft-gui` is a classic two-pane archiver window: a menu bar, a toolbar
+(Add, Extract To, Test, View, Info), an address bar, and a sortable file list
+that browses folders and the inside of `.pcraft` archives the same way.
+Double-click a folder or archive to open it; Backspace goes up. Drop files on
+the window to archive them, or drop an archive to open it. Extract takes the
+whole archive or only the selected entries.
+
+It is built with egui (pure Rust, OpenGL). On Linux it talks to X11 or to
+XWayland, loading the system libraries at run time. Only the Inter font is
+bundled, so file names in scripts Inter does not cover (CJK, for example)
+show as boxes for now. Archives are read-only in the app: to change one,
+create a new one.
+
+```sh
+cargo run --release --features gui --bin packcraft-gui -- [folder-or-archive]
+```
+
 ## Use
 
 ```sh
-cargo build --release
+cargo build --release                                   # add --features gui for the desktop app
 ./target/release/packcraft c art.pcraft my-project/      # create (-t threads, --fast, --verify, --mem bits, --chunk MB)
 ./target/release/packcraft l art.pcraft                  # list
 ./target/release/packcraft t art.pcraft                  # test: decode everything, check every CRC
