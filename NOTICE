@@ -1,0 +1,26 @@
+PackCraft
+Copyright (c) 2026 The PackCraft contributors
+Licensed under MIT OR Apache-2.0.
+
+Third-party software linked into the PackCraft binary
+(full list with versions: Cargo.lock; licences enforced by scripts/check-deps.py)
+
+- lepton_jpeg (Microsoft), Apache-2.0: lossless JPEG recompression.
+- brotli, brotli-decompressor (Dropbox), BSD-3-Clause AND MIT: --fast route.
+- crc32fast, MIT OR Apache-2.0.
+- Transitive dependencies under MIT, Apache-2.0, BSD-2/3-Clause, Zlib, 0BSD,
+  Unlicense and Unicode-3.0, as listed in each crate's metadata.
+
+The context-mixing, arithmetic-coding and audio-prediction code is original,
+written from published descriptions of the techniques (logistic mixing, SSE,
+sign-sign LMS); no GPL or LGPL source was consulted.
+
+Benchmark data (downloaded by corpus/fetch.py, never redistributed here)
+- Standard Ebooks: CC0-1.0, texts in the public domain.
+- Google Fonts (Lora, Noto Sans, Inter, Source Code Pro): OFL-1.1.
+- Our World in Data CO2 and energy datasets: CC-BY-4.0.
+- ripgrep source: MIT OR Unlicense.
+- Khronos glTF-Sample-Assets: FlightHelmet, SheenChair, ToyCar (CC0-1.0);
+  ABeautifulGame (CC-BY-4.0, MaterialX Project, Ed Mackey).
+- NASA images and Artemis II launch audio: public domain (NASA media are not
+  copyrighted in the United States).

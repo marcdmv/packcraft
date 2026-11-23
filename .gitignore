@@ -1,0 +1,7 @@
+/target
+corpus/files/
+corpus/cache/
+bench/out/
+*.pcraft
+*.pcraft.partial
+bench/run.log

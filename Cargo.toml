@@ -1,0 +1,15 @@
+[package]
+name = "packcraft"
+version = "0.1.0"
+edition = "2024"
+description = "Lossless archiver for creative assets, pure Rust: context mixing, Lepton JPEG, LMS audio"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/marcdmv/packcraft"
+readme = "README.md"
+keywords = ["compression", "archive", "context-mixing", "jpeg", "audio"]
+categories = ["compression", "command-line-utilities"]
+
+[dependencies]
+brotli = "9.1.3"
+crc32fast = "1.5.5"
+lepton_jpeg = "0.5.8"

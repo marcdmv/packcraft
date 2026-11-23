@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: No personal data or secrets in a public repo
+        run: python3 -I scripts/check-public.py
+      - name: No personal author e-mails in history
+        run: |
+          bad=$(git log --format='%ae%n%ce' | sort -u | grep -v -E '@users\.noreply\.github\.com$|^noreply@(anthropic|github)\.com$' || true)
+          if [ -n "$bad" ]; then echo "non-noreply e-mails in history:"; echo "$bad"; exit 1; fi
+      - name: Pure Rust and licence allowlist
+        run: python3 -I scripts/check-deps.py
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --locked
