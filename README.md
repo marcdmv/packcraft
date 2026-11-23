@@ -57,9 +57,13 @@ Prebuilt binaries for every release are on the
 | Linux x64 / ARM64 (glibc 2.35+) | `packcraft-<ver>-linux-x64.tar.gz`, `-linux-arm64.tar.gz` |
 
 Each archive holds the command-line tool `packcraft` and the desktop app
-`packcraft-gui`, with a `.sha256` file next to it. The builds are not code
-signed yet: on macOS run `xattr -dr com.apple.quarantine PackCraft.app` once,
-and on Windows choose "More info, Run anyway" in SmartScreen.
+`packcraft-gui`, with a `.sha256` file next to it. The builds are not yet
+signed with a publisher certificate, so the first launch needs one extra step:
+
+- macOS: open `PackCraft.app`, click Done on the "could not verify" message,
+  then System Settings, Privacy & Security, Open Anyway. Or, in Terminal:
+  `xattr -dr com.apple.quarantine PackCraft.app`.
+- Windows: on the SmartScreen message choose More info, Run anyway.
 
 ## Desktop app
 

@@ -5,6 +5,7 @@
   <key>CFBundleName</key><string>PackCraft</string>
   <key>CFBundleDisplayName</key><string>PackCraft</string>
   <key>CFBundleIdentifier</key><string>io.github.packcraft</string>
+  <key>CFBundleIconFile</key><string>PackCraft</string>
   <key>CFBundleExecutable</key><string>packcraft-gui</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>

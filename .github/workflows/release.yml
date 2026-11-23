@@ -57,6 +57,14 @@ jobs:
               mkdir -p "$app/MacOS"
               cp "$bin/packcraft-gui" "$app/MacOS/packcraft-gui"
               sed "s/@VERSION@/$ver/" packaging/macos/Info.plist > "$app/Info.plist"
+              mkdir -p "$app/Resources"
+              python3 -I packaging/macos/make-icns.py "$app/Resources/PackCraft.icns"
+              # The linker signs a lone binary ad hoc; a bundle needs its own
+              # signature over Info.plist and resources, or a downloaded copy
+              # is reported as "damaged". Ad hoc until a Developer ID exists.
+              codesign --force --sign - --timestamp=none "dist/$dir/packcraft"
+              codesign --force --sign - --timestamp=none "dist/$dir/PackCraft.app"
+              codesign --verify --strict --verbose=2 "dist/$dir/PackCraft.app"
               tar -C dist -czf "dist/$dir.tar.gz" "$dir"
               art="$dir.tar.gz" ;;
             *)
