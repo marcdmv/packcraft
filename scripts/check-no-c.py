@@ -16,7 +16,18 @@ root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "target")
 outs = [d for d in root.glob("**/build/**/out") if d.is_dir()]
 if not outs:
     sys.exit(f"check-no-c: no build output under {root}; run cargo build first")
-found = sorted(str(f) for d in outs for f in d.rglob("*") if f.suffix.lower() in NATIVE)
+
+
+def rustc_import_lib(f: pathlib.Path) -> bool:
+    """rustc writes <name>.dll.lib next to a Rust dylib or proc-macro <name>.dll on
+    Windows (newer cargo keeps both in the unit's out dir). That is an import
+    library for Rust code, not compiled C: allowed only with its sibling .dll."""
+    n = f.name.lower()
+    return n.endswith(".dll.lib") and f.with_name(f.name[:-4]).is_file()
+
+
+found = sorted(str(f) for d in outs for f in d.rglob("*")
+               if f.suffix.lower() in NATIVE and not rustc_import_lib(f))
 if found:
     print("check-no-c: refusing, native code was compiled:", *found, sep="\n  ", file=sys.stderr)
     sys.exit(1)
