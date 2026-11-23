@@ -240,6 +240,30 @@ impl Sink {
         Ok(())
     }
 
+    /// Like `file`, for decoders that push their output: `fill` writes the
+    /// entry into the writer it is given and returns how many bytes it wrote.
+    pub(crate) fn write_with(&mut self, at: Option<&Path>, mtime: Option<SystemTime>, fill: &mut dyn FnMut(&mut dyn Write) -> Result<u64, String>) -> Result<(), String> {
+        let n = match at {
+            Some(at) => {
+                if let Some(p) = at.parent() {
+                    Self::dir(p)?;
+                }
+                let f = File::create(at).map_err(|e| format!("{}: {e}", at.display()))?;
+                let mut w = io::BufWriter::with_capacity(1 << 20, f);
+                let n = fill(&mut w)?;
+                let f = w.into_inner().map_err(|e| format!("{}: {e}", at.display()))?;
+                if let Some(t) = mtime {
+                    let _ = f.set_modified(t);
+                }
+                n
+            }
+            None => fill(&mut io::sink())?,
+        };
+        self.count += 1;
+        self.bytes += n;
+        Ok(())
+    }
+
     pub(crate) fn link(&mut self, name: &str, at: Option<PathBuf>, target: String) -> Result<(), String> {
         check_link_target(name, &target)?;
         if let Some(at) = at {

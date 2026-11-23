@@ -21,6 +21,20 @@ Third-party software linked into the PackCraft binary
 - Transitive dependencies under MIT, Apache-2.0, BSD-2/3-Clause, Zlib, 0BSD,
   ISC, BSL-1.0, CC0-1.0, Unlicense and Unicode-3.0, as listed in each crate's metadata.
 
+Code ported into PackCraft (notices also kept in each file)
+- src/rar/v5.rs: RAR 5 decoder ported from libarchive's
+  archive_read_support_format_rar5.c, Copyright (c) 2018 Grzegorz Antoniak,
+  BSD-2-Clause.
+- src/rar/v4.rs: RAR 2.9-4.x decoder ported from libarchive's
+  archive_read_support_format_rar.c, Copyright (c) 2003-2007 Tim Kientzle,
+  Copyright (c) 2011 Andres Mejia, BSD-2-Clause.
+- src/rar/ppmd/: PPMd var.H with RAR's range coder, vendored from the
+  ppmd-rust crate (CC0-1.0 OR MIT-0), itself a port of Igor Pavlov's public
+  domain 7-Zip code based on PPMd var.H by Dmitry Shkarin (public domain).
+- tests/data/rar/: test archives from libarchive's test suite, BSD-2-Clause
+  (licence text in tests/data/rar/README.md).
+No RARLAB unRAR source was used; PackCraft does not create RAR archives.
+
 The context-mixing, arithmetic-coding and audio-prediction code is original,
 written from published descriptions of the techniques (logistic mixing, SSE,
 sign-sign LMS); no GPL or LGPL source was consulted.

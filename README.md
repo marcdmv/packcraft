@@ -21,7 +21,7 @@ PackCraft looks at each file's content, not its name. Then it sends the file dow
 | `.pcraft` | yes (best ratio, the routes above) | yes | `name.pcraft.001`, `.002`, ... |
 | `.zip` | yes (Deflate, optional AES-256) | yes (Deflate, Deflate64, bzip2, LZMA, XZ, PPMd, stored; AES and ZipCrypto) | `name.z01`, `.z02`, ... `name.zip` (the zip spec's split format); `name.zip.001` sets open too |
 | `.7z` | yes (LZMA2 solid, optional AES-256 with hidden file names) | yes | `name.7z.001`, `.002`, ... |
-| `.rar` | no (proprietary format) | landing next: RAR 4 and RAR 5 | `name.part1.rar`, ... and the old `name.rar` + `.r00`, `.r01`, ... |
+| `.rar` | no (proprietary format) | yes: RAR 2.9 to 4.x and RAR 5, solid, stored, symlinks (not encrypted RAR yet) | `name.part1.rar`, ... and the old `name.rar` + `.r00`, `.r01`, ... |
 
 Open any part of a set and PackCraft finds the rest. The zip and 7z engines are
 the pure-Rust `zip` and `sevenz-rust2` crates; files they write open in 7-Zip,
