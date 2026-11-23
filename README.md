@@ -90,6 +90,15 @@ Double-click a folder or archive to open it; Backspace goes up. Drop files on
 the window to archive them, or drop an archive to open it. Extract takes the
 whole archive or only the selected entries.
 
+**Finder right-click (macOS).** Options > Install Finder actions (or
+`packcraft-gui --install-finder-actions`) adds four Quick Actions to the
+Finder context menu: *PackCraft - Compress* (one click, your saved format and
+settings, never overwrites), *Compress with settings* (opens the Add dialog),
+*Extract here* and *Extract to folder* (several archives at once, each set
+once however many of its parts you selected). The window closes when the job
+succeeds and stays open with the error when it does not. RAR is extract-only:
+the format is proprietary, so compressing makes zip, 7z or pcraft.
+
 It is built with egui (pure Rust, OpenGL). On Linux it talks to X11 or to
 XWayland, loading the system libraries at run time. Only the Inter font is
 bundled, so file names in scripts Inter does not cover (CJK, for example)

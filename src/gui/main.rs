@@ -11,6 +11,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod finder;
 mod icons;
 
 use eframe::egui::{
@@ -30,6 +32,31 @@ const ACCENT: Color32 = Color32::from_rgb(0xE0, 0x7A, 0x2E);
 const ACCENT_RGB: [u8; 3] = [0xE0, 0x7A, 0x2E];
 
 fn main() -> eframe::Result {
+    // Scriptable install of the Finder Quick Actions, no window.
+    #[cfg(target_os = "macos")]
+    match std::env::args().nth(1).as_deref() {
+        Some("--install-finder-actions") => match finder::install() {
+            Ok(dir) => {
+                println!("Installed {} Finder Quick Actions in {}", finder::ACTIONS.len(), dir.display());
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("packcraft-gui: {e}");
+                std::process::exit(1)
+            }
+        },
+        Some("--remove-finder-actions") => match finder::remove() {
+            Ok(n) => {
+                println!("Removed {n} Finder Quick Actions");
+                std::process::exit(0)
+            }
+            Err(e) => {
+                eprintln!("packcraft-gui: {e}");
+                std::process::exit(1)
+            }
+        },
+        _ => {}
+    }
     let launch = Launch::from_args(std::env::args_os().skip(1).map(PathBuf::from).collect());
     let icon = egui::IconData { rgba: icons::window_icon(64, ACCENT_RGB), width: 64, height: 64 };
     let options = eframe::NativeOptions {
@@ -200,6 +227,10 @@ enum Launch {
     Open(Option<PathBuf>),
     Add(Vec<PathBuf>),
     AddDefault(Vec<PathBuf>),
+    /// Extract each archive into the folder it is in.
+    ExtractHere(Vec<PathBuf>),
+    /// Extract each archive into a new folder named after it.
+    ExtractTo(Vec<PathBuf>),
 }
 
 impl Launch {
@@ -207,6 +238,8 @@ impl Launch {
         match args.first().and_then(|a| a.to_str()) {
             Some("--add") => Launch::Add(args[1..].to_vec()),
             Some("--add-default") => Launch::AddDefault(args[1..].to_vec()),
+            Some("--extract-here") => Launch::ExtractHere(args[1..].to_vec()),
+            Some("--extract-to") => Launch::ExtractTo(args[1..].to_vec()),
             _ => Launch::Open(args.into_iter().next()),
         }
     }
@@ -257,6 +290,10 @@ struct App {
     defaults: Defaults,
     /// Work to start on the first frame (needs the context).
     pending: Option<Launch>,
+    /// Archives still to extract (archive, destination), from a Finder action.
+    queue: Vec<(PathBuf, PathBuf)>,
+    /// Close the window once the queue is done without an error.
+    quit_when_done: bool,
 }
 
 impl App {
@@ -280,12 +317,21 @@ impl App {
             passwords: Default::default(),
             defaults: Defaults::load(),
             pending: None,
+            queue: Vec::new(),
+            quit_when_done: false,
         };
         match launch {
             Launch::Open(start) => app.navigate(start.unwrap_or(folder)),
             Launch::Add(inputs) | Launch::AddDefault(inputs) if inputs.is_empty() => app.navigate(folder),
             other @ (Launch::Add(_) | Launch::AddDefault(_)) => {
                 let (Launch::Add(inputs) | Launch::AddDefault(inputs)) = &other else { unreachable!() };
+                let dir = inputs[0].parent().map(Path::to_path_buf).unwrap_or(folder);
+                app.navigate(dir);
+                app.pending = Some(other);
+            }
+            Launch::ExtractHere(inputs) | Launch::ExtractTo(inputs) if inputs.is_empty() => app.navigate(folder),
+            other @ (Launch::ExtractHere(_) | Launch::ExtractTo(_)) => {
+                let (Launch::ExtractHere(inputs) | Launch::ExtractTo(inputs)) = &other else { unreachable!() };
                 let dir = inputs[0].parent().map(Path::to_path_buf).unwrap_or(folder);
                 app.navigate(dir);
                 app.pending = Some(other);
@@ -588,6 +634,43 @@ impl App {
         self.dialog = Dialog::Extract { archive, only, dest, open_after: true };
     }
 
+    /// Finder "Extract here" / "Extract to folder": one job per archive set,
+    /// in order, quitting when all succeed.
+    fn queue_extracts(&mut self, inputs: Vec<PathBuf>, own_folder: bool) {
+        let mut seen = BTreeSet::new();
+        let mut skipped = Vec::new();
+        for p in inputs {
+            // Several parts of one set selected: extract the set once.
+            let first = match formats::detect(&p) {
+                Ok((_, set)) if formats::is_archive(&p) => set.parts[0].clone(),
+                _ => {
+                    skipped.push(file_name(&p));
+                    continue;
+                }
+            };
+            if !seen.insert(first.clone()) {
+                continue;
+            }
+            let parent = first.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let dest = if own_folder { free_name(&parent.join(set_stem(&first))) } else { parent };
+            self.queue.push((first, dest));
+        }
+        if !skipped.is_empty() {
+            self.queue.clear();
+            return self.message("Extract", format!("Not an archive PackCraft can open: {}", skipped.join(", ")), true);
+        }
+        self.quit_when_done = true;
+        self.next_queued();
+    }
+
+    fn next_queued(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let (archive, dest) = self.queue.remove(0);
+        self.start_extract(archive, None, dest, false);
+    }
+
     fn target_archive(&self) -> Option<PathBuf> {
         match &self.loc {
             Location::Archive { file, .. } => Some(file.clone()),
@@ -738,8 +821,21 @@ impl App {
                     if open_after {
                         open_with_system(&dest);
                     }
+                    if !self.queue.is_empty() {
+                        self.next_queued();
+                    } else if std::mem::take(&mut self.quit_when_done) {
+                        if let Some(ctx) = &self.ctx_hint {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
                 }
-                Err(e) => self.message("Extraction failed", e, true),
+                Err(e) => {
+                    // Stay open and say what failed; the rest of the queue waits.
+                    self.quit_when_done = false;
+                    let left = if self.queue.is_empty() { String::new() } else { format!("\n\n{} more archive(s) were not extracted.", self.queue.len()) };
+                    self.queue.clear();
+                    self.message("Extraction failed", format!("{e}{left}"), true)
+                }
             },
             JobDone::Tested { archive, result } => match result {
                 Ok((n, bytes)) => self.message(
@@ -768,10 +864,14 @@ impl eframe::App for App {
             Some(Launch::Add(inputs)) => self.add_dialog(inputs),
             Some(Launch::AddDefault(inputs)) => {
                 self.add_dialog(inputs);
-                if let Dialog::Add(form) = std::mem::replace(&mut self.dialog, Dialog::None) {
+                if let Dialog::Add(mut form) = std::mem::replace(&mut self.dialog, Dialog::None) {
+                    // One click never fails on an existing name: "photos 2.zip".
+                    form.archive = free_name(Path::new(&form.archive)).display().to_string();
                     self.start_create(*form, true);
                 }
             }
+            Some(Launch::ExtractHere(inputs)) => self.queue_extracts(inputs, false),
+            Some(Launch::ExtractTo(inputs)) => self.queue_extracts(inputs, true),
             _ => {}
         }
         let mut actions: Vec<Action> = Vec::new();
@@ -817,6 +917,31 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     egui::widgets::global_theme_preference_buttons(ui);
+                    #[cfg(target_os = "macos")]
+                    {
+                        ui.separator();
+                        let label = if finder::installed() { "Reinstall Finder actions" } else { "Install Finder actions" };
+                        if ui.button(label).clicked() {
+                            match finder::install() {
+                                Ok(dir) => self.message(
+                                    "Finder actions installed",
+                                    format!(
+                                        "Right-click files in Finder, then Quick Actions (or Services):\n\n  PackCraft - Compress: one click, with your saved settings\n  PackCraft - Compress with settings: opens the Add dialog\n  PackCraft - Extract here\n  PackCraft - Extract to folder\n\nInstalled in {}. If you move PackCraft, install them again. \
+                                         RAR stays extract-only: the format is proprietary, so PackCraft creates zip, 7z or pcraft.",
+                                        dir.display()
+                                    ),
+                                    false,
+                                ),
+                                Err(e) => self.message("Could not install the Finder actions", e, true),
+                            }
+                        }
+                        if finder::installed() && ui.button("Remove Finder actions").clicked() {
+                            match finder::remove() {
+                                Ok(n) => self.message("Finder actions removed", format!("Removed {n} Quick Actions."), false),
+                                Err(e) => self.message("Could not remove the Finder actions", e, true),
+                            }
+                        }
+                    }
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About PackCraft").clicked() {
@@ -1250,6 +1375,20 @@ fn tool_button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egu
 
 /// The name of a set without its archive and part suffixes:
 /// `photos.part01.rar`, `photos.7z.001`, `photos.r00` and `photos.zip` all give `photos`.
+/// `p` if nothing is there yet, else "name 2.ext", "name 3.ext" ...
+fn free_name(p: &Path) -> PathBuf {
+    if !p.exists() {
+        return p.to_path_buf();
+    }
+    let parent = p.parent().unwrap_or(Path::new("."));
+    let name = file_name(p);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() && !p.is_dir() => (s.to_string(), format!(".{e}")),
+        _ => (name.clone(), String::new()),
+    };
+    (2..).map(|i| parent.join(format!("{stem} {i}{ext}"))).find(|c| !c.exists()).unwrap()
+}
+
 fn set_stem(p: &Path) -> String {
     let mut name = file_name(p);
     loop {
@@ -1446,9 +1585,24 @@ mod tests {
     }
 
     #[test]
+    fn free_names_never_overwrite() {
+        let d = std::env::temp_dir().join(format!("packcraft-free-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("photos")).unwrap();
+        std::fs::write(d.join("photos.zip"), b"x").unwrap();
+        std::fs::write(d.join("photos 2.zip"), b"x").unwrap();
+        assert_eq!(free_name(&d.join("photos.zip")), d.join("photos 3.zip"));
+        assert_eq!(free_name(&d.join("photos")), d.join("photos 2"));
+        assert_eq!(free_name(&d.join("new.7z")), d.join("new.7z"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn launch_modes() {
         assert!(matches!(Launch::from_args(vec!["--add".into(), "a".into()]), Launch::Add(v) if v.len() == 1));
         assert!(matches!(Launch::from_args(vec!["x.zip".into()]), Launch::Open(Some(_))));
+        assert!(matches!(Launch::from_args(vec!["--extract-here".into(), "a.rar".into(), "b.zip".into()]), Launch::ExtractHere(v) if v.len() == 2));
+        assert!(matches!(Launch::from_args(vec!["--extract-to".into(), "a.rar".into()]), Launch::ExtractTo(v) if v.len() == 1));
     }
 
     #[test]
