@@ -8,6 +8,12 @@ Third-party software linked into the PackCraft binary
 - lepton_jpeg (Microsoft), Apache-2.0: lossless JPEG recompression.
 - brotli, brotli-decompressor (Dropbox), BSD-3-Clause AND MIT: --fast route.
 - crc32fast, MIT OR Apache-2.0.
+- zip (the zip-rs project), MIT: ZIP reading and writing.
+- sevenz-rust2 and lzma-rust2, Apache-2.0: 7z reading and writing, LZMA/LZMA2.
+- ppmd-rust, CC0-1.0 OR MIT-0: PPMd for zip and 7z.
+- libbz2-rs-sys and bzip2 (the trifectatech pure-Rust port), bzip2-1.0.6 and
+  MIT OR Apache-2.0: bzip2 for zip and 7z.
+- zlib-rs / miniz_oxide (via flate2), Zlib and MIT OR Apache-2.0: Deflate.
 - eframe, egui, egui_extras, egui_glow, winit, glow, glutin (desktop app only),
   MIT OR Apache-2.0.
 - Inter font by The Inter Project Authors, OFL-1.1 (assets/fonts/Inter-OFL.txt),

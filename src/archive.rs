@@ -445,7 +445,7 @@ fn parse(data: &[u8]) -> Result<Parsed, String> {
 }
 
 /// Refuses absolute paths and `..`, so an archive cannot write outside `dest`.
-fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_join(dest: &Path, rel: &str) -> Result<PathBuf, String> {
     let p = Path::new(rel);
     if rel.is_empty() || rel.contains('\\') || p.components().any(|c| !matches!(c, Component::Normal(_))) {
         return Err(format!("refusing unsafe path in archive: {rel:?}"));
@@ -460,7 +460,7 @@ pub struct ListItem {
 }
 
 pub fn list(archive: &Path) -> Result<Vec<ListItem>, String> {
-    let data = std::fs::read(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    let data = crate::volumes::read_all(archive)?;
     let p = parse(&data)?;
     Ok(p.entries
         .iter()
@@ -484,7 +484,7 @@ pub fn extract(archive: &Path, dest: Option<&Path>, threads: usize) -> Result<(u
 /// accepts. Every entry is still decoded and CRC-checked (solid groups have
 /// to be decoded whole anyway). Returns the count and bytes written.
 pub fn extract_filtered(archive: &Path, dest: Option<&Path>, threads: usize, keep: &dyn Fn(&str) -> bool) -> Result<(usize, u64), String> {
-    let data = std::fs::read(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    let data = crate::volumes::read_all(archive)?;
     let p = parse(&data)?;
     if let Some(d) = dest {
         for e in &p.entries {
@@ -545,7 +545,7 @@ pub fn extract_filtered(archive: &Path, dest: Option<&Path>, threads: usize, kee
 }
 
 /// A link target must be relative and must stay inside the extracted tree.
-fn check_link_target(entry: &str, target: &str) -> Result<(), String> {
+pub(crate) fn check_link_target(entry: &str, target: &str) -> Result<(), String> {
     let refuse = || Err(format!("refusing link {entry:?} -> {target:?}: it points outside the archive"));
     if target.is_empty() || target.starts_with('/') || target.contains('\\') || target.contains(':') {
         return refuse();
@@ -567,12 +567,12 @@ fn check_link_target(entry: &str, target: &str) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn make_symlink(target: &str, at: &Path) -> Result<(), String> {
+pub(crate) fn make_symlink(target: &str, at: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(target, at).map_err(|e| format!("{}: {e}", at.display()))
 }
 
 #[cfg(windows)]
-fn make_symlink(target: &str, at: &Path) -> Result<(), String> {
+pub(crate) fn make_symlink(target: &str, at: &Path) -> Result<(), String> {
     std::os::windows::fs::symlink_file(target.replace('/', "\\"), at)
         .map_err(|e| format!("{}: cannot create symlink ({e}); Windows needs Developer Mode or admin rights", at.display()))
 }

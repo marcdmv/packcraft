@@ -1,7 +1,13 @@
 //! PackCraft desktop app: a file-manager style archiver window.
 //!
-//! Browse folders, open .pcraft archives like folders, add files, extract,
-//! test and inspect. All archive work runs on a background thread.
+//! Browse folders, open archives (.pcraft, .zip, .7z, .rar and their parts)
+//! like folders, add files, extract, test and inspect. All archive work runs on
+//! a background thread.
+//!
+//! `packcraft-gui <archive-or-folder>` opens it; `packcraft-gui --add <path>...`
+//! opens the Add dialog for those paths (used by the Finder and Explorer
+//! actions); `--add-default` creates the archive straight away with the
+//! remembered settings.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -12,7 +18,9 @@ use eframe::egui::{
 };
 use egui_extras::{Column, TableBuilder};
 use icons::Icon;
-use packcraft::archive::{self, ListItem, Options, Route};
+use packcraft::archive::Options;
+use packcraft::formats::{self, CreateOptions, CreateReport, Format, Item};
+use packcraft::volumes;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -20,10 +28,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const ACCENT: Color32 = Color32::from_rgb(0xE0, 0x7A, 0x2E);
 const ACCENT_RGB: [u8; 3] = [0xE0, 0x7A, 0x2E];
-const EXT: &str = "pcraft";
 
 fn main() -> eframe::Result {
-    let start = std::env::args_os().nth(1).map(PathBuf::from);
+    let launch = Launch::from_args(std::env::args_os().skip(1).map(PathBuf::from).collect());
     let icon = egui::IconData { rgba: icons::window_icon(64, ACCENT_RGB), width: 64, height: 64 };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -44,7 +51,7 @@ fn main() -> eframe::Result {
                 s.visuals.hyperlink_color = ACCENT;
                 s.spacing.item_spacing = Vec2::new(8.0, 5.0);
             });
-            Ok(Box::new(App::new(start)))
+            Ok(Box::new(App::new(launch)))
         }),
     )
 }
@@ -62,7 +69,7 @@ fn install_font(ctx: &egui::Context) {
 
 enum Location {
     Folder(PathBuf),
-    Archive { file: PathBuf, items: Vec<ListItem>, prefix: String },
+    Archive { file: PathBuf, items: Vec<Item>, prefix: String },
 }
 
 #[derive(Clone)]
@@ -86,10 +93,123 @@ enum SortBy {
 
 enum Dialog {
     None,
-    Add { inputs: Vec<PathBuf>, archive: String, fast: bool, verify: bool },
+    Add(Box<AddForm>),
+    Password { archive: PathBuf, retry: Retry, input: String, wrong: bool },
     Extract { archive: PathBuf, only: Option<Vec<String>>, dest: String, open_after: bool },
     Message { title: String, body: String, error: bool },
     About,
+}
+
+/// What to run again once the user has typed a password.
+#[derive(Clone)]
+enum Retry {
+    Open,
+    Test,
+    Extract { only: Option<Vec<String>>, dest: PathBuf, open_after: bool },
+    View { entry: String },
+}
+
+/// Split presets: (label, bytes). 0 = no split.
+const SPLITS: [(&str, u64); 7] = [
+    ("No split", 0),
+    ("10 MB", 10_000_000),
+    ("100 MB", 100_000_000),
+    ("700 MB (CD)", 700 << 20),
+    ("4092 MB (FAT32)", 4092 << 20),
+    ("4.7 GB (DVD)", 4_700_000_000),
+    ("Custom", u64::MAX),
+];
+
+#[derive(Clone)]
+struct AddForm {
+    inputs: Vec<PathBuf>,
+    archive: String,
+    format: Format,
+    fast: bool,
+    level: u32,
+    split: usize,
+    custom_split: String,
+    password: String,
+    confirm: String,
+    verify: bool,
+}
+
+/// The settings the Add dialog starts from (the last ones used).
+#[derive(Clone)]
+struct Defaults {
+    format: Format,
+    fast: bool,
+    level: u32,
+    split: usize,
+    custom_split: String,
+    verify: bool,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Defaults { format: Format::Zip, fast: false, level: 9, split: 0, custom_split: "250 MB".into(), verify: true }
+    }
+}
+
+impl Defaults {
+    fn path() -> Option<PathBuf> {
+        let base = if cfg!(windows) {
+            std::env::var_os("APPDATA").map(PathBuf::from)
+        } else if cfg!(target_os = "macos") {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+        } else {
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        };
+        base.map(|b| b.join("PackCraft").join("settings.txt"))
+    }
+
+    /// `key=value` lines; anything unreadable falls back to the default.
+    fn load() -> Self {
+        let mut d = Defaults::default();
+        let Some(text) = Self::path().and_then(|p| std::fs::read_to_string(p).ok()) else { return d };
+        for line in text.lines() {
+            let Some((k, v)) = line.split_once('=') else { continue };
+            match k.trim() {
+                "format" => d.format = Format::WRITABLE.into_iter().find(|f| f.extension() == v.trim()).unwrap_or(d.format),
+                "fast" => d.fast = v.trim() == "true",
+                "level" => d.level = v.trim().parse().unwrap_or(d.level).min(9),
+                "split" => d.split = v.trim().parse().unwrap_or(0).min(SPLITS.len() - 1),
+                "custom_split" => d.custom_split = v.trim().to_string(),
+                "verify" => d.verify = v.trim() == "true",
+                _ => {}
+            }
+        }
+        d
+    }
+
+    fn save(&self) {
+        let Some(p) = Self::path() else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = format!(
+            "format={}\nfast={}\nlevel={}\nsplit={}\ncustom_split={}\nverify={}\n",
+            self.format.extension(), self.fast, self.level, self.split, self.custom_split, self.verify
+        );
+        let _ = std::fs::write(p, text);
+    }
+}
+
+/// How the app was started.
+enum Launch {
+    Open(Option<PathBuf>),
+    Add(Vec<PathBuf>),
+    AddDefault(Vec<PathBuf>),
+}
+
+impl Launch {
+    fn from_args(args: Vec<PathBuf>) -> Self {
+        match args.first().and_then(|a| a.to_str()) {
+            Some("--add") => Launch::Add(args[1..].to_vec()),
+            Some("--add-default") => Launch::AddDefault(args[1..].to_vec()),
+            _ => Launch::Open(args.into_iter().next()),
+        }
+    }
 }
 
 struct Job {
@@ -99,10 +219,11 @@ struct Job {
 }
 
 enum JobDone {
-    Created { archive: PathBuf, report: Result<archive::Report, String> },
-    Extracted { dest: PathBuf, result: Result<(usize, u64), String>, open_after: bool },
+    Created { archive: PathBuf, report: Result<CreateReport, String>, quit_after: bool },
+    Opened { archive: PathBuf, result: Result<Vec<Item>, String> },
+    Extracted { archive: PathBuf, retry: Retry, dest: PathBuf, result: Result<(usize, u64), String>, open_after: bool },
     Tested { archive: PathBuf, result: Result<(usize, u64), String> },
-    Viewed { result: Result<PathBuf, String> },
+    Viewed { archive: PathBuf, retry: Retry, result: Result<PathBuf, String> },
 }
 
 enum Action {
@@ -131,10 +252,15 @@ struct App {
     status: String,
     /// The egui context, refreshed every frame, for commands that start a job.
     ctx_hint: Option<egui::Context>,
+    /// Passwords typed this session, per archive.
+    passwords: std::collections::HashMap<PathBuf, String>,
+    defaults: Defaults,
+    /// Work to start on the first frame (needs the context).
+    pending: Option<Launch>,
 }
 
 impl App {
-    fn new(start: Option<PathBuf>) -> Self {
+    fn new(launch: Launch) -> Self {
         let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
         let folder = home.or_else(|| std::env::current_dir().ok()).unwrap_or_else(|| PathBuf::from("/"));
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
@@ -151,9 +277,25 @@ impl App {
             job: None,
             status: String::new(),
             ctx_hint: None,
+            passwords: Default::default(),
+            defaults: Defaults::load(),
+            pending: None,
         };
-        app.navigate(start.unwrap_or(folder));
+        match launch {
+            Launch::Open(start) => app.navigate(start.unwrap_or(folder)),
+            Launch::Add(inputs) | Launch::AddDefault(inputs) if inputs.is_empty() => app.navigate(folder),
+            other @ (Launch::Add(_) | Launch::AddDefault(_)) => {
+                let (Launch::Add(inputs) | Launch::AddDefault(inputs)) = &other else { unreachable!() };
+                let dir = inputs[0].parent().map(Path::to_path_buf).unwrap_or(folder);
+                app.navigate(dir);
+                app.pending = Some(other);
+            }
+        }
         app
+    }
+
+    fn password_for(&self, archive: &Path) -> Option<String> {
+        self.passwords.get(archive).cloned()
     }
 
     // ------------------------------------------------------------ navigation
@@ -162,13 +304,20 @@ impl App {
         let path = if path.is_relative() { self.current_folder().join(path) } else { path };
         if path.is_dir() {
             self.loc = Location::Folder(path);
-        } else if path.is_file() && is_archive(&path) {
-            match archive::list(&path) {
+        } else if path.is_file() && formats::is_archive(&path) {
+            let pw = self.password_for(&path);
+            // Listing a big 7z or RAR set takes a moment: off the UI thread once it runs.
+            if let Some(ctx) = self.ctx_hint.clone() {
+                let label = format!("Opening {}", file_name(&path));
+                return self.spawn(&ctx, label, move || JobDone::Opened { result: formats::list(&path, pw.as_deref()), archive: path });
+            }
+            match formats::list(&path, pw.as_deref()) {
                 Ok(items) => self.loc = Location::Archive { file: path, items, prefix: String::new() },
+                Err(e) if formats::needs_password(&e) => return self.ask_password(path, Retry::Open, e.starts_with(formats::WRONG_PASSWORD)),
                 Err(e) => return self.message("Cannot open archive", e, true),
             }
         } else {
-            return self.message("Not found", format!("{} is not a folder or a .{EXT} archive.", path.display()), true);
+            return self.message("Not found", format!("{} is not a folder or an archive PackCraft can open.", path.display()), true);
         }
         self.reload();
     }
@@ -289,6 +438,111 @@ impl App {
         self.dialog = Dialog::Message { title: title.into(), body: body.into(), error };
     }
 
+    fn ask_password(&mut self, archive: PathBuf, retry: Retry, wrong: bool) {
+        self.passwords.remove(&archive);
+        self.dialog = Dialog::Password { archive, retry, input: String::new(), wrong };
+    }
+
+    fn run_retry(&mut self, archive: PathBuf, retry: Retry) {
+        match retry {
+            Retry::Open => self.navigate(archive),
+            Retry::Test => self.start_test(archive),
+            Retry::Extract { only, dest, open_after } => self.start_extract(archive, only, dest, open_after),
+            Retry::View { entry } => self.start_view(archive, entry),
+        }
+    }
+
+    fn ctx(&self) -> egui::Context {
+        self.ctx_hint.clone().expect("context set every frame")
+    }
+
+    fn start_test(&mut self, archive: PathBuf) {
+        let (threads, pw) = (self.threads, self.password_for(&archive));
+        let a2 = archive.clone();
+        let ctx = self.ctx();
+        self.spawn(&ctx, format!("Testing {}", file_name(&archive)), move || JobDone::Tested {
+            result: formats::extract(&a2, None, threads, pw.as_deref(), &|_| true),
+            archive: a2,
+        });
+    }
+
+    fn start_extract(&mut self, archive: PathBuf, only: Option<Vec<String>>, dest: PathBuf, open_after: bool) {
+        let (threads, pw) = (self.threads, self.password_for(&archive));
+        let retry = Retry::Extract { only: only.clone(), dest: dest.clone(), open_after };
+        let ctx = self.ctx();
+        self.spawn(&ctx, format!("Extracting {}", file_name(&archive)), move || {
+            let result = match only {
+                Some(list) => {
+                    let set: BTreeSet<String> = list.into_iter().collect();
+                    formats::extract(&archive, Some(&dest), threads, pw.as_deref(), &move |p| set.contains(p))
+                }
+                None => formats::extract(&archive, Some(&dest), threads, pw.as_deref(), &|_| true),
+            };
+            JobDone::Extracted { archive, retry, dest, result, open_after }
+        });
+    }
+
+    fn start_view(&mut self, archive: PathBuf, entry: String) {
+        let (threads, pw) = (self.threads, self.password_for(&archive));
+        let dir = std::env::temp_dir().join(format!("packcraft-view-{}", std::process::id()));
+        let retry = Retry::View { entry: entry.clone() };
+        let ctx = self.ctx();
+        self.spawn(&ctx, format!("Opening {entry}"), move || {
+            let keep = entry.clone();
+            let result = formats::extract(&archive, Some(&dir), threads, pw.as_deref(), &move |p| p == keep)
+                .map(|_| dir.join(entry.replace('/', std::path::MAIN_SEPARATOR_STR)));
+            JobDone::Viewed { archive, retry, result }
+        });
+    }
+
+    fn start_create(&mut self, form: AddForm, quit_after: bool) {
+        let mut path = PathBuf::from(form.archive.trim());
+        if path.extension().is_none() {
+            path.set_extension(form.format.extension());
+        }
+        let format = match Format::for_output(&path) {
+            Some(f) => f,
+            None => return self.message("Add to archive", "The archive name must end in .zip, .7z or .pcraft. (PackCraft can open RAR archives but not create them: the format is proprietary.)", true),
+        };
+        let volume = match SPLITS[form.split].1 {
+            0 => None,
+            u64::MAX => match volumes::parse_size(&form.custom_split) {
+                Ok(v) => Some(v),
+                Err(e) => return self.message("Split size", e, true),
+            },
+            v => Some(v),
+        };
+        let password = (!form.password.is_empty()).then(|| form.password.clone());
+        if password.is_some() && form.password != form.confirm {
+            return self.message("Password", "The two passwords are different.", true);
+        }
+        if path.exists() {
+            return self.message("Archive exists", format!("{} already exists. Choose another name.", path.display()), true);
+        }
+        self.defaults = Defaults { format, fast: form.fast, level: form.level, split: form.split, custom_split: form.custom_split.clone(), verify: form.verify };
+        self.defaults.save();
+        let opts = CreateOptions {
+            format,
+            pcraft: Options { threads: self.threads, fast: form.fast, verify: form.verify, ..Options::default() },
+            level: form.level,
+            volume,
+            password,
+        };
+        let (inputs, verify, threads) = (form.inputs, form.verify, self.threads);
+        let p2 = path.clone();
+        let ctx = self.ctx();
+        self.spawn(&ctx, format!("Creating {}", file_name(&path)), move || {
+            let mut report = formats::create(&p2, &inputs, &opts);
+            // pcraft verifies inside create; zip and 7z are read back here.
+            if let (Ok(r), true, false) = (&report, verify, format == Format::Pcraft) {
+                if let Err(e) = formats::extract(&r.parts[0], None, threads, opts.password.as_deref(), &|_| true) {
+                    report = Err(format!("the archive was written but failed its test: {e}"));
+                }
+            }
+            JobDone::Created { archive: p2, report, quit_after }
+        });
+    }
+
     // ------------------------------------------------------------ commands
 
     fn add_dialog(&mut self, inputs: Vec<PathBuf>) {
@@ -302,44 +556,50 @@ impl App {
             parent.file_name().map(|s| s.to_string_lossy().into_owned())
         }
         .unwrap_or_else(|| "archive".into());
-        let archive = parent.join(format!("{base}.{EXT}")).display().to_string();
-        self.dialog = Dialog::Add { inputs, archive, fast: false, verify: true };
+        let d = self.defaults.clone();
+        let archive = parent.join(format!("{base}.{}", d.format.extension())).display().to_string();
+        self.dialog = Dialog::Add(Box::new(AddForm {
+            inputs,
+            archive,
+            format: d.format,
+            fast: d.fast,
+            level: d.level,
+            split: d.split,
+            custom_split: d.custom_split,
+            password: String::new(),
+            confirm: String::new(),
+            verify: d.verify,
+        }));
     }
 
     fn extract_dialog(&mut self) {
         let (archive, only) = match &self.loc {
             Location::Archive { file, .. } => (file.clone(), self.selected_entries()),
             Location::Folder(_) => {
-                let picked: Vec<PathBuf> = self.selected_paths().into_iter().filter(|p| is_archive(p)).collect();
+                let picked: Vec<PathBuf> = self.selected_paths().into_iter().filter(|p| formats::is_archive(p)).collect();
                 match picked.as_slice() {
                     [one] => (one.clone(), None),
-                    [] => return self.message("Extract", format!("Select a .{EXT} archive, or open one first."), false),
+                    [] => return self.message("Extract", "Select an archive, or open one first.", false),
                     _ => return self.message("Extract", "Select one archive at a time.", false),
                 }
             }
         };
-        let stem = archive.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "extracted".into());
-        let dest = archive.parent().unwrap_or(Path::new(".")).join(stem).display().to_string();
+        let dest = archive.parent().unwrap_or(Path::new(".")).join(set_stem(&archive)).display().to_string();
         self.dialog = Dialog::Extract { archive, only, dest, open_after: true };
     }
 
     fn target_archive(&self) -> Option<PathBuf> {
         match &self.loc {
             Location::Archive { file, .. } => Some(file.clone()),
-            Location::Folder(_) => self.selected_paths().into_iter().find(|p| is_archive(p)),
+            Location::Folder(_) => self.selected_paths().into_iter().find(|p| formats::is_archive(p)),
         }
     }
 
-    fn test_archive(&mut self, ctx: &egui::Context) {
+    fn test_archive(&mut self) {
         let Some(archive) = self.target_archive() else {
-            return self.message("Test", format!("Select a .{EXT} archive, or open one first."), false);
+            return self.message("Test", "Select an archive, or open one first.", false);
         };
-        let threads = self.threads;
-        let a2 = archive.clone();
-        self.spawn(ctx, format!("Testing {}", file_name(&archive)), move || JobDone::Tested {
-            result: archive::extract(&a2, None, threads),
-            archive: a2,
-        });
+        self.start_test(archive);
     }
 
     fn view_selected(&mut self) {
@@ -352,46 +612,43 @@ impl App {
         let Some(entries) = self.selected_entries().filter(|e| e.len() == 1) else {
             return self.message("View", "Select one file inside the archive.", false);
         };
-        let entry = entries[0].clone();
-        let archive = file.clone();
-        let threads = self.threads;
-        let dir = std::env::temp_dir().join(format!("packcraft-view-{}", std::process::id()));
-        let ctx = self.ctx_hint.clone();
-        if let Some(ctx) = ctx {
-            self.spawn(&ctx, format!("Opening {entry}"), move || {
-                let keep = entry.clone();
-                let result = archive::extract_filtered(&archive, Some(&dir), threads, &move |p| p == keep)
-                    .map(|_| dir.join(entry.replace('/', std::path::MAIN_SEPARATOR_STR)));
-                JobDone::Viewed { result }
-            });
-        }
+        let (entry, archive) = (entries[0].clone(), file.clone());
+        self.start_view(archive, entry);
     }
 
     fn info(&mut self) {
         match &self.loc {
             Location::Archive { file, items, .. } => {
-                let packed = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-                let raw: u64 = items.iter().map(|i| i.size).sum();
-                let mut by_route: Vec<(Route, usize, u64)> = Vec::new();
-                for it in items {
-                    match by_route.iter_mut().find(|(r, _, _)| *r == it.route) {
+                let (format, set) = match formats::detect(file) {
+                    Ok(v) => v,
+                    Err(e) => return self.message("Archive information", e, true),
+                };
+                let packed = set.total_len().unwrap_or(0);
+                let files: Vec<&Item> = items.iter().filter(|i| !i.is_dir).collect();
+                let raw: u64 = files.iter().map(|i| i.size).sum();
+                let mut by_route: Vec<(String, usize, u64)> = Vec::new();
+                for it in &files {
+                    match by_route.iter_mut().find(|(r, _, _)| *r == it.method) {
                         Some(e) => {
                             e.1 += 1;
                             e.2 += it.size;
                         }
-                        None => by_route.push((it.route, 1, it.size)),
+                        None => by_route.push((it.method.clone(), 1, it.size)),
                     }
                 }
+                let parts = if set.parts.len() > 1 { format!(" in {} parts", set.parts.len()) } else { String::new() };
+                let locked = if items.iter().any(|i| i.encrypted) { "\nEncrypted: yes" } else { "" };
                 let mut body = format!(
-                    "{}\n\n{} files, {} unpacked\nArchive size {} ({:.1}% of original)\n\nMethods:\n",
+                    "{}\n\n{} archive{parts}{locked}\n{} files, {} unpacked\nArchive size {} ({:.1}% of original)\n\nMethods:\n",
                     file.display(),
-                    items.len(),
+                    format.name(),
+                    files.len(),
                     human(raw),
                     human(packed),
                     if raw > 0 { 100.0 * packed as f64 / raw as f64 } else { 0.0 }
                 );
                 for (r, n, b) in by_route {
-                    body.push_str(&format!("  {:<16} {n} files, {}\n", r.name(), human(b)));
+                    body.push_str(&format!("  {:<16} {n} files, {}\n", if r.is_empty() { "-" } else { r.as_str() }, human(b)));
                 }
                 self.message("Archive information", body, false);
             }
@@ -425,17 +682,30 @@ impl App {
         let secs = job.started.elapsed().as_secs_f64();
         self.job = None;
         match done {
-            JobDone::Created { archive, report } => match report {
+            JobDone::Created { archive, report, quit_after } => match report {
                 Ok(r) => {
+                    if quit_after {
+                        open_with_system_reveal(&r.parts[r.parts.len() - 1]);
+                        if let Some(ctx) = &self.ctx_hint {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        return;
+                    }
                     let mut body = format!(
-                        "{}\n\n{} -> {} ({:.2}%) in {secs:.1} s\n",
+                        "{}\n\n{} files: {} -> {} ({:.2}%) in {secs:.1} s\n",
                         archive.display(),
+                        r.files,
                         human(r.input_bytes),
                         human(r.archive_bytes),
                         100.0 * r.archive_bytes as f64 / r.input_bytes.max(1) as f64
                     );
-                    for (route, st) in &r.stats {
-                        body.push_str(&format!("\n  {:<16} {} files  {} -> {}", route.name(), st.files, human(st.raw), human(st.packed)));
+                    if r.parts.len() > 1 {
+                        body.push_str(&format!("\n{} parts: {} ... {}\n", r.parts.len(), file_name(&r.parts[0]), file_name(&r.parts[r.parts.len() - 1])));
+                    }
+                    if let Some(p) = &r.pcraft {
+                        for (route, st) in &p.stats {
+                            body.push_str(&format!("\n  {:<16} {} files  {} -> {}", route.name(), st.files, human(st.raw), human(st.packed)));
+                        }
                     }
                     if !r.skipped.is_empty() {
                         body.push_str(&format!("\n\nSkipped (not a file or link): {}", r.skipped.join(", ")));
@@ -446,7 +716,23 @@ impl App {
                 }
                 Err(e) => self.message("Could not create the archive", e, true),
             },
-            JobDone::Extracted { dest, result, open_after } => match result {
+            JobDone::Opened { archive, result: Err(e) } if formats::needs_password(&e) => {
+                self.ask_password(archive, Retry::Open, e.starts_with(formats::WRONG_PASSWORD));
+            }
+            JobDone::Opened { archive, result } => match result {
+                Ok(items) => {
+                    self.loc = Location::Archive { file: archive, items, prefix: String::new() };
+                    self.reload();
+                }
+                Err(e) => self.message("Cannot open archive", e, true),
+            },
+            JobDone::Extracted { archive, retry, result: Err(e), .. } | JobDone::Viewed { archive, retry, result: Err(e) } if formats::needs_password(&e) => {
+                self.ask_password(archive, retry, e.starts_with(formats::WRONG_PASSWORD));
+            }
+            JobDone::Tested { archive, result: Err(e) } if formats::needs_password(&e) => {
+                self.ask_password(archive, Retry::Test, e.starts_with(formats::WRONG_PASSWORD));
+            }
+            JobDone::Extracted { dest, result, open_after, .. } => match result {
                 Ok((n, bytes)) => {
                     self.status = format!("Extracted {n} files ({}) to {} in {secs:.1} s", human(bytes), dest.display());
                     if open_after {
@@ -458,12 +744,12 @@ impl App {
             JobDone::Tested { archive, result } => match result {
                 Ok((n, bytes)) => self.message(
                     "Test passed",
-                    format!("{}\n\nAll {n} files ({}) decoded and every CRC matches ({secs:.1} s).", archive.display(), human(bytes)),
+                    format!("{}\n\nAll {n} entries ({}) decoded and every checksum matches ({secs:.1} s).", archive.display(), human(bytes)),
                     false,
                 ),
                 Err(e) => self.message("Test FAILED", format!("{}\n\n{e}", archive.display()), true),
             },
-            JobDone::Viewed { result } => match result {
+            JobDone::Viewed { result, .. } => match result {
                 Ok(p) => open_with_system(&p),
                 Err(e) => self.message("Cannot open the file", e, true),
             },
@@ -478,12 +764,22 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.ctx_hint = Some(ctx.clone());
         self.poll_job();
+        match self.pending.take() {
+            Some(Launch::Add(inputs)) => self.add_dialog(inputs),
+            Some(Launch::AddDefault(inputs)) => {
+                self.add_dialog(inputs);
+                if let Dialog::Add(form) = std::mem::replace(&mut self.dialog, Dialog::None) {
+                    self.start_create(*form, true);
+                }
+            }
+            _ => {}
+        }
         let mut actions: Vec<Action> = Vec::new();
 
         // Files dropped from the OS: an archive opens, anything else goes to "Add".
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         if !dropped.is_empty() && self.job.is_none() {
-            if dropped.len() == 1 && is_archive(&dropped[0]) {
+            if dropped.len() == 1 && formats::is_archive(&dropped[0]) {
                 actions.push(Action::Navigate(dropped[0].clone()));
             } else {
                 actions.push(Action::AddPaths(dropped));
@@ -621,7 +917,7 @@ impl eframe::App for App {
                 }
                 Action::AddPaths(p) => self.add_dialog(p),
                 Action::Extract => self.extract_dialog(),
-                Action::Test => self.test_archive(&ctx),
+                Action::Test => self.test_archive(),
                 Action::View => self.view_selected(),
                 Action::Info => self.info(),
             }
@@ -751,22 +1047,83 @@ impl App {
                 });
                 close = resp.inner || resp.should_close();
             }
-            Dialog::Add { inputs, archive, fast, verify } => {
+            Dialog::Add(form) => {
                 let resp = Modal::new(Id::unique("packcraft-add")).show(ctx, |ui| {
-                    ui.set_width(520.0);
+                    ui.set_width(540.0);
                     ui.heading("Add to archive");
                     ui.add_space(4.0);
-                    ui.label(format!("{} item(s): {}", inputs.len(), inputs.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")));
+                    ui.label(format!("{} item(s): {}", form.inputs.len(), form.inputs.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")));
                     ui.add_space(6.0);
                     ui.label("Archive name");
-                    ui.add(egui::TextEdit::singleline(archive).desired_width(f32::INFINITY));
+                    ui.add(egui::TextEdit::singleline(&mut form.archive).desired_width(f32::INFINITY));
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    egui::Grid::new("add-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                        ui.label("Format");
+                        ui.horizontal(|ui| {
+                            for f in Format::WRITABLE {
+                                let label = match f {
+                                    Format::Pcraft => "PackCraft (smallest)",
+                                    Format::Zip => "ZIP (opens everywhere)",
+                                    _ => "7z",
+                                };
+                                if ui.radio(form.format == f, label).clicked() && form.format != f {
+                                    form.format = f;
+                                    form.level = if f == Format::Zip { 9 } else { 7 };
+                                    let mut p = PathBuf::from(form.archive.trim());
+                                    p.set_extension(f.extension());
+                                    form.archive = p.display().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
                         ui.label("Compression");
-                        ui.radio_value(fast, false, "Best (smallest)");
-                        ui.radio_value(fast, true, "Fast (quick to extract)");
+                        if form.format == Format::Pcraft {
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut form.fast, false, "Best (smallest)");
+                                ui.radio_value(&mut form.fast, true, "Fast (quick to extract)");
+                            });
+                        } else {
+                            let hint = match form.level {
+                                0 => "store",
+                                1..=3 => "fast",
+                                4..=6 => "normal",
+                                _ => "maximum",
+                            };
+                            ui.add(egui::Slider::new(&mut form.level, 0..=9).text(hint));
+                        }
+                        ui.end_row();
+                        ui.label("Split into parts");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("split").selected_text(SPLITS[form.split].0).show_ui(ui, |ui| {
+                                for (i, (label, _)) in SPLITS.iter().enumerate() {
+                                    ui.selectable_value(&mut form.split, i, *label);
+                                }
+                            });
+                            if SPLITS[form.split].1 == u64::MAX {
+                                ui.add(egui::TextEdit::singleline(&mut form.custom_split).desired_width(90.0).hint_text("250 MB"));
+                            }
+                        });
+                        ui.end_row();
+                        let can_encrypt = form.format != Format::Pcraft;
+                        ui.label("Password");
+                        ui.add_enabled_ui(can_encrypt, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut form.password).password(true).desired_width(150.0).hint_text("none"));
+                                ui.add(egui::TextEdit::singleline(&mut form.confirm).password(true).desired_width(150.0).hint_text("repeat"));
+                            });
+                        });
+                        ui.end_row();
+                        if !can_encrypt {
+                            ui.label("");
+                            ui.label(RichText::new("Encryption needs ZIP or 7z (AES-256).").weak());
+                            ui.end_row();
+                        }
                     });
-                    ui.checkbox(verify, "Test the archive after creating it");
+                    if form.format == Format::Pcraft {
+                        form.password.clear();
+                        form.confirm.clear();
+                    }
+                    ui.checkbox(&mut form.verify, "Test the archive after creating it");
                     ui.add_space(8.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let ok = ui.add(egui::Button::new(RichText::new("Create").strong()).fill(ACCENT.linear_multiply(0.8))).clicked();
@@ -777,25 +1134,41 @@ impl App {
                 });
                 let (ok, cancel) = resp.inner;
                 if ok {
-                    let mut path = PathBuf::from(archive.trim());
-                    if path.extension().is_none() {
-                        path.set_extension(EXT);
-                    }
-                    let (inputs, fast, verify) = (inputs.clone(), *fast, *verify);
-                    start = Some(Box::new(move |app: &mut App| {
-                        if path.exists() {
-                            return app.message("Archive exists", format!("{} already exists. Choose another name.", path.display()), true);
-                        }
-                        let opts = Options { threads: app.threads, fast, verify, ..Options::default() };
-                        let p2 = path.clone();
-                        let ctx = app.ctx_hint.clone().expect("context set every frame");
-                        app.spawn(&ctx, format!("Creating {}", file_name(&path)), move || JobDone::Created {
-                            report: archive::create(&p2, &inputs, &opts),
-                            archive: p2,
-                        });
-                    }));
+                    let form = (**form).clone();
+                    start = Some(Box::new(move |app: &mut App| app.start_create(form, false)));
                 }
                 close = ok || cancel || resp.should_close();
+            }
+            Dialog::Password { archive, retry, input, wrong } => {
+                let resp = Modal::new(Id::unique("packcraft-password")).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.heading("Password");
+                    ui.add_space(4.0);
+                    ui.label(format!("{} is encrypted.", file_name(archive)));
+                    if *wrong {
+                        ui.label(RichText::new("That password is wrong. Try again.").color(ui.visuals().error_fg_color));
+                    }
+                    ui.add_space(6.0);
+                    let r = ui.add(egui::TextEdit::singleline(input).password(true).desired_width(f32::INFINITY));
+                    r.request_focus();
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let ok = ui.add(egui::Button::new(RichText::new("OK").strong()).fill(ACCENT.linear_multiply(0.8))).clicked();
+                        let cancel = ui.button("Cancel").clicked();
+                        (ok || enter, cancel)
+                    })
+                    .inner
+                });
+                let (ok, cancel) = resp.inner;
+                if ok && !input.is_empty() {
+                    let (archive, retry, pw) = (archive.clone(), retry.clone(), input.clone());
+                    start = Some(Box::new(move |app: &mut App| {
+                        app.passwords.insert(archive.clone(), pw);
+                        app.run_retry(archive, retry);
+                    }));
+                }
+                close = (ok && !input.is_empty()) || cancel || resp.should_close();
             }
             Dialog::Extract { archive, only, dest, open_after } => {
                 let resp = Modal::new(Id::unique("packcraft-extract")).show(ctx, |ui| {
@@ -816,8 +1189,7 @@ impl App {
                             }
                         }
                         if ui.small_button("In a folder named after it").clicked() {
-                            let stem = archive.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            *dest = archive.parent().unwrap_or(Path::new(".")).join(stem).display().to_string();
+                            *dest = archive.parent().unwrap_or(Path::new(".")).join(set_stem(archive)).display().to_string();
                         }
                     });
                     ui.checkbox(open_after, "Open the folder when done");
@@ -832,21 +1204,7 @@ impl App {
                 let (ok, cancel) = resp.inner;
                 if ok {
                     let (archive, only, dest, open_after) = (archive.clone(), only.clone(), PathBuf::from(dest.trim()), *open_after);
-                    start = Some(Box::new(move |app: &mut App| {
-                        let threads = app.threads;
-                        let ctx = app.ctx_hint.clone().expect("context set every frame");
-                        let d2 = dest.clone();
-                        app.spawn(&ctx, format!("Extracting {}", file_name(&archive)), move || {
-                            let result = match only {
-                                Some(list) => {
-                                    let set: BTreeSet<String> = list.into_iter().collect();
-                                    archive::extract_filtered(&archive, Some(&d2), threads, &move |p| set.contains(p))
-                                }
-                                None => archive::extract(&archive, Some(&d2), threads),
-                            };
-                            JobDone::Extracted { dest: d2, result, open_after }
-                        });
-                    }));
+                    start = Some(Box::new(move |app: &mut App| app.start_extract(archive, only, dest, open_after)));
                 }
                 close = ok || cancel || resp.should_close();
             }
@@ -890,8 +1248,35 @@ fn tool_button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egu
 
 // ---------------------------------------------------------------- helpers
 
-fn is_archive(p: &Path) -> bool {
-    p.extension().is_some_and(|e| e.eq_ignore_ascii_case(EXT))
+/// The name of a set without its archive and part suffixes:
+/// `photos.part01.rar`, `photos.7z.001`, `photos.r00` and `photos.zip` all give `photos`.
+fn set_stem(p: &Path) -> String {
+    let mut name = file_name(p);
+    loop {
+        let Some((head, ext)) = name.rsplit_once('.') else { break };
+        let e = ext.to_ascii_lowercase();
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let strip = matches!(e.as_str(), "zip" | "7z" | "rar" | "pcraft")
+            || digits(&e)
+            || (e.len() == 3 && matches!(e.as_bytes()[0], b'r'..=b'z') && digits(&e[1..]))
+            || (e.starts_with("part") && digits(&e[4..]));
+        if !strip || head.is_empty() {
+            break;
+        }
+        name = head.to_string();
+    }
+    name
+}
+
+fn archive_kind(p: &Path) -> String {
+    let e = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    match e.as_str() {
+        "pcraft" => "PackCraft archive".into(),
+        "zip" => "ZIP archive".into(),
+        "7z" => "7z archive".into(),
+        "rar" => "RAR archive".into(),
+        _ => "Archive part".into(),
+    }
 }
 
 fn file_name(p: &Path) -> String {
@@ -910,11 +1295,11 @@ fn folder_rows(dir: &Path, hidden: bool) -> std::io::Result<Vec<Row>> {
         let Ok(meta) = meta else { continue };
         let is_dir = meta.is_dir();
         let path = item.path();
-        let is_archive = !is_dir && is_archive(&path);
+        let is_archive = !is_dir && formats::is_archive(&path);
         let kind = if is_dir {
             "Folder".to_string()
         } else if is_archive {
-            "PackCraft archive".to_string()
+            archive_kind(&path)
         } else {
             path.extension().map(|e| format!("{} file", e.to_string_lossy().to_uppercase())).unwrap_or_else(|| "File".into())
         };
@@ -923,19 +1308,26 @@ fn folder_rows(dir: &Path, hidden: bool) -> std::io::Result<Vec<Row>> {
     Ok(rows)
 }
 
-fn archive_rows(items: &[ListItem], prefix: &str) -> Vec<Row> {
+fn archive_rows(items: &[Item], prefix: &str) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let mut dirs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for it in items {
         let Some(rest) = it.path.strip_prefix(prefix) else { continue };
-        match rest.split_once('/') {
+        if rest.is_empty() {
+            continue;
+        }
+        // An explicit folder entry shows the folder even when it is empty.
+        let split = if it.is_dir { Some((rest.split('/').next().unwrap_or(rest), "")) } else { rest.split_once('/') };
+        match split {
             Some((dir, _)) => {
                 let k = *dirs.entry(dir.to_string()).or_insert_with(|| {
                     rows.push(Row { name: dir.to_string(), is_dir: true, is_archive: false, size: 0, files: 0, kind: "Folder".into(), modified: None });
                     rows.len() - 1
                 });
-                rows[k].size += it.size;
-                rows[k].files += 1;
+                if !it.is_dir {
+                    rows[k].size += it.size;
+                    rows[k].files += 1;
+                }
             }
             None => rows.push(Row {
                 name: rest.to_string(),
@@ -943,7 +1335,7 @@ fn archive_rows(items: &[ListItem], prefix: &str) -> Vec<Row> {
                 is_archive: false,
                 size: it.size,
                 files: 1,
-                kind: it.route.name().to_string(),
+                kind: if it.encrypted { format!("{} (encrypted)", it.method) } else { it.method.clone() },
                 modified: None,
             }),
         }
@@ -1007,6 +1399,19 @@ fn open_with_system(p: &Path) {
     }
 }
 
+/// Shows the file selected in Finder / Explorer (Linux: opens its folder).
+fn open_with_system_reveal(p: &Path) {
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg("-R").arg(p).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg(format!("/select,{}", p.display())).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let r = std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(Path::new("."))).spawn();
+    if let Err(e) = r {
+        eprintln!("cannot show {}: {e}", p.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,14 +1426,29 @@ mod tests {
 
     #[test]
     fn archive_listing_groups_folders() {
-        let it = |p: &str, s| ListItem { path: p.into(), size: s, route: Route::Cm };
-        let items = vec![it("p/a.txt", 3), it("p/sub/b.txt", 4), it("p/sub/c/d.txt", 5), it("top.txt", 1)];
+        let it = |p: &str, s| Item { path: p.into(), size: s, packed: None, method: "LZMA2".into(), is_dir: false, encrypted: false };
+        let mut items = vec![it("p/a.txt", 3), it("p/sub/b.txt", 4), it("p/sub/c/d.txt", 5), it("top.txt", 1)];
+        items.push(Item { is_dir: true, ..it("p/empty", 0) });
         let root = archive_rows(&items, "");
         assert_eq!(root.len(), 2);
         let p = archive_rows(&items, "p/");
         let sub = p.iter().find(|r| r.name == "sub").unwrap();
         assert!(sub.is_dir && sub.size == 9 && sub.files == 2);
         assert!(p.iter().any(|r| r.name == "a.txt" && !r.is_dir));
+        assert!(p.iter().any(|r| r.name == "empty" && r.is_dir && r.files == 0));
+    }
+
+    #[test]
+    fn set_stems() {
+        for (name, want) in [("photos.part01.rar", "photos"), ("photos.7z.001", "photos"), ("photos.r00", "photos"), ("photos.zip", "photos"), ("my.notes.zip", "my.notes"), ("a.z01", "a")] {
+            assert_eq!(set_stem(Path::new(name)), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn launch_modes() {
+        assert!(matches!(Launch::from_args(vec!["--add".into(), "a".into()]), Launch::Add(v) if v.len() == 1));
+        assert!(matches!(Launch::from_args(vec!["x.zip".into()]), Launch::Open(Some(_))));
     }
 
     #[test]

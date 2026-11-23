@@ -14,6 +14,19 @@ PackCraft looks at each file's content, not its name. Then it sends the file dow
 | Store | Already-compressed data (entropy > 7.95 bits/byte) | Kept as is, no time wasted |
 | `--fast` | Everything generic | Brotli q9: decompresses about 10x faster |
 
+## Formats
+
+| Format | Create | Open, test, extract | Split into parts |
+|---|---|---|---|
+| `.pcraft` | yes (best ratio, the routes above) | yes | `name.pcraft.001`, `.002`, ... |
+| `.zip` | yes (Deflate, optional AES-256) | yes (Deflate, Deflate64, bzip2, LZMA, XZ, PPMd, stored; AES and ZipCrypto) | `name.z01`, `.z02`, ... `name.zip` (the zip spec's split format); `name.zip.001` sets open too |
+| `.7z` | yes (LZMA2 solid, optional AES-256 with hidden file names) | yes | `name.7z.001`, `.002`, ... |
+| `.rar` | no (proprietary format) | landing next: RAR 4 and RAR 5 | `name.part1.rar`, ... and the old `name.rar` + `.r00`, `.r01`, ... |
+
+Open any part of a set and PackCraft finds the rest. The zip and 7z engines are
+the pure-Rust `zip` and `sevenz-rust2` crates; files they write open in 7-Zip,
+WinRAR, Info-ZIP `unzip`, bsdtar and Windows Explorer (single-part zip).
+
 Every file carries a CRC32. Extraction refuses paths that escape the target folder
 (and symlinks pointing outside it). Archives are written atomically.
 
@@ -69,7 +82,10 @@ signed with a publisher certificate, so the first launch needs one extra step:
 
 `packcraft-gui` is a classic two-pane archiver window: a menu bar, a toolbar
 (Add, Extract To, Test, View, Info), an address bar, and a sortable file list
-that browses folders and the inside of `.pcraft` archives the same way.
+that browses folders and the inside of archives (`.pcraft`, `.zip`, `.7z`,
+`.rar` and their parts) the same way. The Add dialog picks the format, the
+compression level, a split size (CD, FAT32, DVD presets or your own) and an
+optional password; it remembers your last choice.
 Double-click a folder or archive to open it; Backspace goes up. Drop files on
 the window to archive them, or drop an archive to open it. Extract takes the
 whole archive or only the selected entries.
@@ -89,10 +105,15 @@ cargo run --release --features gui --bin packcraft-gui -- [folder-or-archive]
 ```sh
 cargo build --release                                   # add --features gui for the desktop app
 ./target/release/packcraft c art.pcraft my-project/      # create (-t threads, --fast, --verify, --mem bits, --chunk MB)
+./target/release/packcraft c art.zip my-project/ -v 700m # zip in 700 MB parts: art.z01, art.z02, ..., art.zip
+./target/release/packcraft c art.7z my-project/ -p pass  # 7z, AES-256, file names hidden (-l 0-9 sets the level)
 ./target/release/packcraft l art.pcraft                  # list
 ./target/release/packcraft t art.pcraft                  # test: decode everything, check every CRC
-./target/release/packcraft x art.pcraft out/             # extract
+./target/release/packcraft x photos.part1.rar out/       # extract: any format, any part of a set
 ```
+
+The format follows the archive's extension. `PACKCRAFT_PASSWORD` in the
+environment works like `-p` without showing the password in the process list.
 
 The format is experimental (`PKCRAFT1`) and may change before 1.0.
 

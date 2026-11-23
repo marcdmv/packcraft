@@ -43,12 +43,19 @@ Never bypass the hook with `--no-verify`; fix the content instead.
 
 ## Code rules
 
-- **Pure Rust, no exceptions**, dependencies included: no C/C++ code, no `-sys`
-  crates, no `cc`/`cmake`/`bindgen` build steps. `scripts/check-deps.py` enforces
+- **Pure Rust, no exceptions**, dependencies included: no C/C++ code, no crate
+  that binds a C library, no `cc`/`cmake`/`bindgen` build steps. (A pure-Rust
+  port that keeps a `-sys` name for API compatibility, like `libbz2-rs-sys`,
+  is fine: `scripts/check-no-c.py` proves nothing native was compiled.) `scripts/check-deps.py` enforces
   this and the licence allowlist in CI.
 - Dependency licences: MIT, Apache-2.0, BSD-2/3-Clause, Zlib, 0BSD, ISC,
-  Unlicense, Unicode-3.0, CC0. GPL, LGPL and AGPL code is banned, and so is
+  Unlicense, Unicode-3.0, CC0, MIT-0, bzip2-1.0.6 (BSD-style, for the
+  pure-Rust bzip2 port). GPL, LGPL and AGPL code is banned, and so is
   reading it: algorithms are implemented clean-room from specs and papers.
+  Permissively licensed code (MIT, BSD, Apache) may be ported to Rust when its
+  copyright notice is kept in the file and in NOTICE. RAR is extract-only:
+  never write a RAR compressor (the format is proprietary), and never use
+  RARLAB's unRAR source or decompiled WinRAR.
 - Every change keeps `cargo test --release` green on Linux, macOS and Windows.
 - A benchmark claim must be reproducible with `corpus/fetch.py`,
   `corpus/derive_audio.py` and `bench/run.py`, and name the tool versions.

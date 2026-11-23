@@ -17,7 +17,11 @@ import subprocess
 import sys
 
 ALLOWED = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Zlib", "0BSD", "ISC",
-           "Unlicense", "Unicode-3.0", "Unicode-DFS-2016", "CC0-1.0", "BSL-1.0"}
+           "Unlicense", "Unicode-3.0", "Unicode-DFS-2016", "CC0-1.0", "BSL-1.0",
+           "MIT-0",
+           # bzip2's own BSD-style licence (no copyleft), used by the pure-Rust
+           # libbz2-rs-sys port that reads and writes bzip2 inside ZIP and 7z.
+           "bzip2-1.0.6"}
 # Crates whose `links` names an operating-system library that every install of
 # that OS ships (loaded, never compiled), allowed like libc or winapi.
 OS_LINKS = {"objc-sys"}  # the macOS Objective-C runtime (libobjc)

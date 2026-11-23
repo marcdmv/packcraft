@@ -7,3 +7,7 @@ pub mod audio;
 pub mod cm;
 pub mod coder;
 pub mod jpeg;
+pub mod volumes;
+pub mod zipspan;
+pub mod formats;
+pub mod rar;
